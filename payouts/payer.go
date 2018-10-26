@@ -19,16 +19,23 @@ const txCheckInterval = 5 * time.Second
 
 type PayoutsConfig struct {
 	Enabled      bool   `json:"enabled"`
-	RequirePeers int64  `json:"requirePeers"`
 	Interval     string `json:"interval"`
+	TxLimiter    string `json:"txLimiter"`
+
+	// Daemon settings
 	Daemon       string `json:"daemon"`
+	RequirePeers int64  `json:"requirePeers"`
 	Timeout      string `json:"timeout"`
 	Address      string `json:"address"`
+
+	// Gas price settings
 	Gas          string `json:"gas"`
 	GasPrice     string `json:"gasPrice"`
 	AutoGas      bool   `json:"autoGas"`
 
 	// In Shannon
+	ContractThreshold int64 `json:"thresholdContract"`
+	ContractFee int64 `json:"contractFee"`
 	NormalThreshold int64 `json:"thresholdNormal"`
 	NormalFee int64 `json:"normalFee"`
 	InactiveThreshold int64 `json:"thresholdInactive"`
@@ -50,6 +57,7 @@ type PayoutsProcessor struct {
 	config   *PayoutsConfig
 	backend  *storage.RedisClient
 	rpc      *rpc.RPCClient
+	txLimiter time.Duration
 	halt     bool
 	lastFail error
 }
@@ -73,6 +81,9 @@ func (u *PayoutsProcessor) Start() {
 	intv := util.MustParseDuration(u.config.Interval)
 	timer := time.NewTimer(intv)
 	log.Printf("Set payouts interval to %v", intv)
+	
+	u.txLimiter = util.MustParseDuration(u.config.TxLimiter)
+	log.Printf("Set payouts tx limiter to %v", u.txLimiter)
 
 	payments := u.backend.GetPendingPayments()
 	if len(payments) > 0 {
@@ -122,22 +133,34 @@ func (u *PayoutsProcessor) process() {
 
 	for _, login := range payees {
 		amount, _ := u.backend.GetBalance(login)
+		isContract, _ := u.rpc.IsContract(login)
 		lastActivity, _ := u.backend.GetLastActivity(login)
+		lastPayment, _ := u.backend.GetLastPayment(login)
 		amountInShannon := big.NewInt(amount)
+		payFee := u.config.NormalFee
+		payThreshold := u.config.NormalThreshold
+
 		inactive := lastActivity.Before(time.Now().AddDate(0, 0, -7))
+		shouldpay := lastPayment.Before(time.Now().Add(- u.txLimiter))
 
 		if inactive {
-			amountInShannon.Sub(amountInShannon, big.NewInt(u.config.InactiveFee))
-		} else {
-			amountInShannon.Sub(amountInShannon, big.NewInt(u.config.NormalFee))
+			payFee = u.config.InactiveFee
+			payThreshold = u.config.InactiveThreshold
 		}
+		if isContract {
+			payFee = u.config.ContractFee
+			payThreshold = u.config.ContractThreshold
+		}
+
+		if !u.reachedThreshold(amountInShannon, payThreshold) || !shouldpay {
+			continue
+		}
+
+		amountInShannon.Sub(amountInShannon, big.NewInt(payFee))
 
 		// Shannon^2 = Wei
 		amountInWei := new(big.Int).Mul(amountInShannon, util.Shannon)
 
-		if !u.reachedThreshold(amountInShannon, inactive) {
-			continue
-		}
 		mustPay++
 
 		// Require active peers before processing
@@ -157,10 +180,8 @@ func (u *PayoutsProcessor) process() {
 			break
 		}
 		if poolBalance.Cmp(amountInWei) < 0 {
-			err := fmt.Errorf("Not enough balance for payment, need %s Wei, pool has %s Wei",
+			log.Printf("Not enough balance for payment, need %s Wei, pool has %s Wei",
 				amountInWei.String(), poolBalance.String())
-			u.halt = true
-			u.lastFail = err
 			break
 		}
 
@@ -206,21 +227,19 @@ func (u *PayoutsProcessor) process() {
 		totalAmount.Add(totalAmount, big.NewInt(amount))
 		log.Printf("Paid %v Shannon to %v, TxHash: %v", amount, login, txHash)
 
-		time.Sleep(txCheckInterval)
-
 		// Wait for TX confirmation before further payouts
-		//for {
-		//	log.Printf("Waiting for tx confirmation: %v", txHash)
-		//	time.Sleep(txCheckInterval)
-		//	receipt, err := u.rpc.GetTxReceipt(txHash)
-		//	if err != nil {
-		//		log.Printf("Failed to get tx receipt for %v: %v", txHash, err)
-		//	}
-		//	if receipt != nil && receipt.Confirmed() {
-		//		break
-		//	}
-		//}
-		//log.Printf("Payout tx for %s confirmed: %s", login, txHash)
+		for {
+			log.Printf("Waiting for tx confirmation: %v", txHash)
+			time.Sleep(txCheckInterval)
+			receipt, err := u.rpc.GetTxReceipt(txHash)
+			if err != nil {
+				log.Printf("Failed to get tx receipt for %v: %v", txHash, err)
+			}
+			if receipt != nil && receipt.Confirmed() {
+				break
+			}
+		}
+		log.Printf("Payout tx for %s confirmed: %s", login, txHash)
 	}
 
 	if mustPay > 0 {
@@ -257,14 +276,9 @@ func (self PayoutsProcessor) checkPeers() bool {
 	return true
 }
 
-func (self PayoutsProcessor) reachedThreshold(amount *big.Int, inactive bool) bool {
-	threshold := big.NewInt(self.config.NormalThreshold)
-	fee := big.NewInt(self.config.NormalFee)
-	if inactive {
-		threshold = big.NewInt(self.config.InactiveThreshold)
-		fee = big.NewInt(self.config.InactiveFee)
-	}
-	return ( threshold.Cmp(amount) < 0 ) && ( fee.Cmp(amount) < 0 )
+func (self PayoutsProcessor) reachedThreshold(amount *big.Int, payThreshold int64) bool {
+	threshold := big.NewInt(payThreshold)
+	return ( threshold.Cmp(amount) < 0 )
 }
 
 func formatPendingPayments(list []*storage.PendingPayment) string {

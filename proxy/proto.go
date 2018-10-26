@@ -10,8 +10,16 @@ type JSONRpcReq struct {
 
 type EthStratumReq struct  {
 	Id     interface{} `json:"id"`
-	Method string           `json:"method"`
+	Version string     `json:"jsonrpc,omitempty"`
+	Method string      `json:"method"`
 	Params interface{} `json:"params"`
+}
+
+type EthStratumResp struct  {
+	Id     interface{} `json:"id"`
+	Version string     `json:"jsonrpc,omitempty"`
+	Result interface{} `json:"result"`
+	Error interface{}  `json:"error,omitempty"`
 }
 
 type StratumReq struct {

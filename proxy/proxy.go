@@ -17,6 +17,12 @@ import (
 	"github.com/CryptoManiac/open-ethereum-pool/util"
 )
 
+type WorkDiff struct {
+	Difficulty int64
+	PassDel bool
+	IsDel   bool
+}
+
 type ProxyServer struct {
 	config             *Config
 	blockTemplate      atomic.Value
@@ -32,10 +38,15 @@ type ProxyServer struct {
 	sessionsMu sync.RWMutex
 	sessions   map[*Session]struct{}
 	timeout    time.Duration
+	nonceSize  int
 
 	// EthereumStratum jobs queue
 	jobsMu sync.RWMutex
 	Jobs *JobQueue
+	workMu sync.RWMutex
+	workDiff map[string]*WorkDiff
+	minDiffFloat float64
+	maxDiffFloat float64
 }
 
 type Session struct {
@@ -46,8 +57,11 @@ type Session struct {
 	conn  *net.TCPConn
 	login string
 
-	// EthereumStratum extranonce
+	// EthereumStratum extranonce, current difficulty
+	//   and mining.extranonce.subscribe status
 	Extranonce string
+	Difficulty int64
+	exnSub     bool
 }
 
 func NewProxy(cfg *Config, backend *storage.RedisClient) *ProxyServer {
@@ -59,6 +73,23 @@ func NewProxy(cfg *Config, backend *storage.RedisClient) *ProxyServer {
 
 	proxy := &ProxyServer{config: cfg, backend: backend, policy: policy}
 	proxy.diff = util.GetTargetHex(cfg.Proxy.Difficulty)
+	proxy.workDiff = make(map[string]*WorkDiff)
+	proxy.minDiffFloat = cfg.Proxy.Stratum.MinDiffFloat
+	
+	if proxy.minDiffFloat < 0.1 && cfg.Proxy.Stratum.Protocol == "EthereumStratum" {
+		log.Fatal("For EthereumStratum protocol type, the minimum float difficulty must be set to at least 0.1")
+	}
+	
+	proxy.maxDiffFloat = cfg.Proxy.Stratum.MaxDiffFloat
+	log.Printf("Set minimum float difficulty to %v", proxy.minDiffFloat)
+	log.Printf("Set maximum float difficulty to %v", proxy.maxDiffFloat)
+
+	nonceSize := cfg.Proxy.Stratum.NonceSize
+	if nonceSize < 2 {
+		nonceSize = 2
+	}
+	proxy.nonceSize = nonceSize
+	log.Printf("Set nonce size to %v", proxy.nonceSize)
 
 	proxy.upstreams = make([]*rpc.RPCClient, len(cfg.Upstream))
 	for i, v := range cfg.Upstream {
@@ -90,11 +121,32 @@ func NewProxy(cfg *Config, backend *storage.RedisClient) *ProxyServer {
 	refreshTimer := time.NewTimer(refreshIntv)
 	log.Printf("Set block refresh every %v", refreshIntv)
 
+	cleanIntv := util.MustParseDuration(cfg.Proxy.CleanInterval)
+	cleanTimer := time.NewTimer(cleanIntv)
+
 	checkIntv := util.MustParseDuration(cfg.UpstreamCheckInterval)
 	checkTimer := time.NewTimer(checkIntv)
 
 	stateUpdateIntv := util.MustParseDuration(cfg.Proxy.StateUpdateInterval)
 	stateUpdateTimer := time.NewTimer(stateUpdateIntv)
+
+	go func() {
+		for {
+			select {
+			case <-cleanTimer.C:
+				proxy.workMu.Lock()
+				for k, v := range proxy.workDiff {
+					if v.IsDel && !v.PassDel {
+						delete(proxy.workDiff, k)
+					} else if v.IsDel {
+						proxy.workDiff[k].PassDel = false
+					}
+				}
+				proxy.workMu.Unlock()
+				cleanTimer.Reset(refreshIntv)
+			}
+		}
+	}()
 
 	go func() {
 		for {

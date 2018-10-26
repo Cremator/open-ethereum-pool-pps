@@ -33,6 +33,7 @@ type Proxy struct {
 	PoT_A                float64 `json:"potA"`
 	PoT_Cap              float64 `json:"potCap"`
 	StateUpdateInterval  string `json:"stateUpdateInterval"`
+	CleanInterval        string `json:"cleanInterval"`
 	HashrateExpiration   string `json:"hashrateExpiration"`
 
 	Policy policy.Config `json:"policy"`
@@ -48,6 +49,8 @@ type StratumEndpoint struct {
 	Listen  string `json:"listen"`
 	Protocol string `json:"protocol"`
 	NonceSpace []uint8 `json:"xnSpace"`
+	MinDiffFloat float64 `json:"minDiffFloat"`
+	MaxDiffFloat float64 `json:"maxDiffFloat"`
 	NonceSize int `json:"xnSize"`
 	Timeout string `json:"timeout"`
 	MaxConn int    `json:"maxConn"`
